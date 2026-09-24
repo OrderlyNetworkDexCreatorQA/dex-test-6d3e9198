@@ -92,6 +92,16 @@ jobs:
             else
               UPSTREAM_BRANCH="main"
             fi
+          elif [ "$DEPLOYMENT_ENV" = "dev" ]; then
+            # dev follows the QA template line (same treatment as the API's
+            # audit repos/callback origins); main is the last resort.
+            if git rev-parse --verify upstream/qa >/dev/null 2>&1; then
+              UPSTREAM_BRANCH="qa"
+            elif git rev-parse --verify upstream/staging >/dev/null 2>&1; then
+              UPSTREAM_BRANCH="staging"
+            else
+              UPSTREAM_BRANCH="main"
+            fi
           elif [ "$DEPLOYMENT_ENV" = "qa" ]; then
             if git rev-parse --verify upstream/qa >/dev/null 2>&1; then
               UPSTREAM_BRANCH="qa"
@@ -104,10 +114,13 @@ jobs:
             UPSTREAM_BRANCH="main"
           fi
 
-          # Non-mainnet template lines (qa/staging): on merge conflicts, prefer upstream hunks.
-          # mainnet and fallback-to-main merges stay default (manual resolution if conflict).
+          # Non-mainnet environments: prefer upstream hunks on conflict. Keyed
+          # off the environment (not the resolved branch) so every non-mainnet
+          # line — dev, qa, staging, future envs — stays auto-mergeable even
+          # when it falls back to the main branch. Mainnet keeps the strict
+          # default (manual resolution if a conflict ever appears).
           MERGE_EXTRA=""
-          if [ "$UPSTREAM_BRANCH" = "qa" ] || [ "$UPSTREAM_BRANCH" = "staging" ]; then
+          if [ "$DEPLOYMENT_ENV" != "mainnet" ]; then
             MERGE_EXTRA="-X theirs"
             echo "Merging upstream/$UPSTREAM_BRANCH with -X theirs (conflicted hunks favor upstream)"
           fi
@@ -171,10 +184,11 @@ jobs:
             else
               echo "needs_build=false" >> $GITHUB_OUTPUT
             fi
-            # Plugin installs commit package.json without a refreshed yarn.lock;
-            # only then may the install resolve new deps (exact pins keep it
-            # reproducible). All other builds stay frozen.
-            if echo "$CHANGED" | grep -q "^package\.json$"; then
+            # Plugin installs commit package.json (and the pin manifest)
+            # without a refreshed yarn.lock; only then may the install resolve
+            # new deps (exact pins keep it reproducible). The refreshed lock is
+            # committed back below, so every later build can stay frozen.
+            if echo "$CHANGED" | grep -q -E "^(package\.json|\.orderly-plugin-deps\.json)$"; then
               echo "package_changed=true" >> $GITHUB_OUTPUT
             else
               echo "package_changed=false" >> $GITHUB_OUTPUT
@@ -217,6 +231,17 @@ jobs:
           fi
         id: force-build
 
+      - name: Re-apply Orderly One plugin dependencies
+        if: steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true'
+        run: |
+          # The upstream merge rewrites package.json; restore the plugin pins
+          # before install so generated.ts imports resolve. No-op without a
+          # manifest (no plugins installed). Skipped on the config-only fast
+          # path, which deploys a cached build.
+          if [ -f .github/scripts/apply-plugin-deps.mjs ]; then
+            node .github/scripts/apply-plugin-deps.mjs
+          fi
+
       - name: Install dependencies
         if: (steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true') && steps.check-changes.outputs.package_changed != 'true'
         run: yarn install --frozen-lockfile --prefer-offline
@@ -224,6 +249,20 @@ jobs:
       - name: Install dependencies (with plugin changes)
         if: (steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true') && steps.check-changes.outputs.package_changed == 'true'
         run: yarn install --prefer-offline
+
+      - name: Commit refreshed yarn.lock
+        if: steps.check-changes.outputs.package_changed == 'true'
+        run: |
+          # Keep the fork's lockfile truthful so later builds can stay frozen.
+          # [skip ci] avoids a second workflow run; a non-fast-forward push is
+          # non-fatal (the next sync reconciles).
+          if [ -n "$(git status --porcelain yarn.lock)" ]; then
+            git add yarn.lock
+            git commit -m "chore: refresh yarn.lock for Orderly One plugins [skip ci]"
+            git push origin main || echo "lockfile push skipped (non-fast-forward)"
+          else
+            echo "yarn.lock already current"
+          fi
 
       - name: Build with repository base path
         if: ${{ steps.check-custom-domain.outputs.has_custom_domain == 'false' && (steps.check-changes.outputs.needs_build == 'true' || steps.force-build.outputs.needs_build == 'true') }}
